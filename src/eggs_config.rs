@@ -435,18 +435,10 @@ impl EggConfig {
                 }
             }
             ShellHooks {
-                post_deploy: shell_hooks
-                    .get("post_deploy")
-                    .and_then(parse_shell_hook),
-                post_undeploy: shell_hooks
-                    .get("post_undeploy")
-                    .and_then(parse_shell_hook),
-                pre_deploy: shell_hooks
-                    .get("pre_deploy")
-                    .and_then(parse_shell_hook),
-                pre_undeploy: shell_hooks
-                    .get("pre_undeploy")
-                    .and_then(parse_shell_hook),
+                post_deploy: shell_hooks.get("post_deploy").and_then(parse_shell_hook),
+                post_undeploy: shell_hooks.get("post_undeploy").and_then(parse_shell_hook),
+                pre_deploy: shell_hooks.get("pre_deploy").and_then(parse_shell_hook),
+                pre_undeploy: shell_hooks.get("pre_undeploy").and_then(parse_shell_hook),
             }
         } else {
             ShellHooks::default()

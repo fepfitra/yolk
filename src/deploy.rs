@@ -267,16 +267,12 @@ impl Deployer {
                         ]
                     }),
             )
-            .chain(
-                self.missing_permissions_remove
-                    .iter()
-                    .flat_map(|symlink| {
-                        [
-                            "--delete-symlink".to_string(),
-                            symlink.to_string_lossy().to_string(),
-                        ]
-                    }),
-            )
+            .chain(self.missing_permissions_remove.iter().flat_map(|symlink| {
+                [
+                    "--delete-symlink".to_string(),
+                    symlink.to_string_lossy().to_string(),
+                ]
+            }))
             .collect::<Vec<_>>();
         tracing::info!(
             "Some symlink operations require root permissions: {} {}",
