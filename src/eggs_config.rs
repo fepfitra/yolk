@@ -223,7 +223,6 @@ impl Default for EggConfig {
     }
 }
 
-
 /// Parse a shell hook from a dynamic value.
 /// Supports both simple string syntax and map syntax with fallback:
 ///   - Simple: `pre_deploy: "ls"`
@@ -356,7 +355,7 @@ impl EggConfig {
         };
 
         for (k, _v) in map.iter() {
-            let k: &str = &*k;
+            let k: &str = k;
             if EggConfigKey::from_str(k).is_none() {
                 tracing::warn!("unknown egg config key: {}", k);
             }
@@ -430,16 +429,24 @@ impl EggConfig {
                 .map_err(|t| rhai_error!("`unsafe_shell_hooks` must be a map, but got {t}"))?;
 
             for (k, _v) in shell_hooks.iter() {
-                let k: &str = &*k;
+                let k: &str = k;
                 if ShellHookKey::from_str(k).is_none() {
                     tracing::warn!("unknown key: {}", k);
                 }
             }
             ShellHooks {
-                post_deploy: shell_hooks.get("post_deploy").map(parse_shell_hook).flatten(),
-                post_undeploy: shell_hooks.get("post_undeploy").map(parse_shell_hook).flatten(),
-                pre_deploy: shell_hooks.get("pre_deploy").map(parse_shell_hook).flatten(),
-                pre_undeploy: shell_hooks.get("pre_undeploy").map(parse_shell_hook).flatten(),
+                post_deploy: shell_hooks
+                    .get("post_deploy")
+                    .and_then(parse_shell_hook),
+                post_undeploy: shell_hooks
+                    .get("post_undeploy")
+                    .and_then(parse_shell_hook),
+                pre_deploy: shell_hooks
+                    .get("pre_deploy")
+                    .and_then(parse_shell_hook),
+                pre_undeploy: shell_hooks
+                    .get("pre_undeploy")
+                    .and_then(parse_shell_hook),
             }
         } else {
             ShellHooks::default()
@@ -634,13 +641,20 @@ mod test {
     fn test_run_hook_failure_with_successful_fallback() {
         let hook = HookWithFallback::new("exit 1").with_fallback("echo 'fallback ran'");
         let result = crate::eggs_config::run_hook_for_test(&hook);
-        assert!(result.is_ok(), "Hook should succeed when fallback succeeds: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Hook should succeed when fallback succeeds: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_run_hook_failure_with_failing_fallback() {
         let hook = HookWithFallback::new("exit 1").with_fallback("exit 2");
         let result = crate::eggs_config::run_hook_for_test(&hook);
-        assert!(result.is_err(), "Hook should fail when both primary and fallback fail");
+        assert!(
+            result.is_err(),
+            "Hook should fail when both primary and fallback fail"
+        );
     }
 }

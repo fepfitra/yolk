@@ -69,7 +69,7 @@ impl Deployer {
         } else {
             self.created_symlinks.push(link.to_path_buf());
         }
-        return Ok(());
+        Ok(())
     }
     /// Remove a symlink from at the path `link` pointing to the `original` file.
     pub fn delete_symlink(&mut self, path: impl AsRef<Path>) -> miette::Result<()> {
@@ -260,24 +260,22 @@ impl Deployer {
             .chain(
                 self.missing_permissions_create
                     .iter()
-                    .map(|(original, symlink)| {
+                    .flat_map(|(original, symlink)| {
                         [
                             "--create-symlink".to_string(),
                             format!("{}::::{}", original.display(), symlink.display()),
                         ]
-                    })
-                    .flatten(),
+                    }),
             )
             .chain(
                 self.missing_permissions_remove
                     .iter()
-                    .map(|symlink| {
+                    .flat_map(|symlink| {
                         [
                             "--delete-symlink".to_string(),
                             symlink.to_string_lossy().to_string(),
                         ]
-                    })
-                    .flatten(),
+                    }),
             )
             .collect::<Vec<_>>();
         tracing::info!(
