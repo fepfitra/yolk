@@ -18,6 +18,37 @@ use crate::{
 };
 
 const GITIGNORE_ENTRIES: &[&str] = &["/.git", "/.deployed_cache", "/.yolk_git"];
+/// Tracks which phase of deployment/undeployment succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentPhase {
+    /// Deployment has not started
+    NotStarted,
+    /// Pre-deploy hook ran successfully
+    PreDeploySucceeded,
+    /// Symlink creation phase succeeded
+    SymlinksCreated,
+    /// Post-deploy hook ran successfully
+    PostDeploySucceeded,
+    /// Pre-undeploy hook ran successfully
+    PreUndeploySucceeded,
+    /// Symlink removal phase succeeded
+    SymlinksRemoved,
+    /// Post-undeploy hook ran successfully
+    PostUndeploySucceeded,
+}
+
+impl DeploymentPhase {
+    /// Returns true if deployment symlinks have been created.
+    pub fn has_deployed_symlinks(&self) -> bool {
+        matches!(self, DeploymentPhase::SymlinksCreated | DeploymentPhase::PostDeploySucceeded)
+    }
+
+    /// Returns true if undeployment symlink removal has occurred.
+    pub fn has_removed_symlinks(&self) -> bool {
+        matches!(self, DeploymentPhase::SymlinksRemoved | DeploymentPhase::PostUndeploySucceeded)
+    }
+}
+
 
 pub struct Yolk {
     yolk_paths: YolkPaths,
@@ -85,8 +116,14 @@ impl Yolk {
         egg: &Egg,
         mappings: &HashMap<PathBuf, PathBuf>,
     ) -> Result<(), MultiError> {
+        // Phase tracking for rollback
+        let mut phase = DeploymentPhase::PreDeploySucceeded;
         let mut errs = Vec::new();
+        
+        // Phase 1: Run pre-deploy hook
         egg.config().unsafe_shell_hooks.run_pre_deploy()?;
+        
+        // Phase 2: Create symlinks
         for (in_egg, deployed) in mappings {
             let mut deploy_mapping = || -> miette::Result<()> {
                 match egg.config().strategy {
@@ -123,47 +160,115 @@ impl Yolk {
         }
 
         if !errs.is_empty() {
+            // Pre-deploy failure: symlinks not created, no rollback needed
             return Err(MultiError::new(
                 format!("Failed to deploy egg {}", egg.name()),
                 errs,
             ));
         }
+        
+        // Symlinks created successfully - mark phase
+        phase = DeploymentPhase::SymlinksCreated;
         debug_assert!(
-            !errs.is_empty() || egg.is_deployed()?,
+            egg.is_deployed().unwrap_or(true),
             "Egg::is_deployed should return true after deploying"
         );
-        egg.config().unsafe_shell_hooks.run_post_deploy()?;
-        Ok(())
+        
+        // Phase 3: Run post-deploy hook with rollback on failure
+        match egg.config().unsafe_shell_hooks.run_post_deploy() {
+            Ok(()) => {
+                phase = DeploymentPhase::PostDeploySucceeded;
+                debug_assert!(
+                    egg.is_deployed().unwrap_or(true),
+                    "Egg::is_deployed should return true after post-deploy hook"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Post-deploy failure: rollback by undeploying created symlinks
+                tracing::warn!(
+                    "Post-deploy hook failed for egg {}, rolling back deployment",
+                    egg.name()
+                );
+                let rollback_deployer = &mut Deployer::new();
+                for (in_egg, deployed) in mappings {
+                    let _ = rollback_deployer.remove_symlink_recursive(in_egg, &deployed);
+                }
+                Err(MultiError::new(
+                    format!("Failed to deploy egg {} (rolled back)", egg.name()),
+                    vec![e],
+                ))
+            }
+        }
     }
-
     fn undeploy_egg(
         &self,
         deployer: &mut Deployer,
         egg: &Egg,
         mappings: &HashMap<PathBuf, PathBuf>,
     ) -> Result<(), MultiError> {
+        // Phase tracking for rollback
+        let mut phase = DeploymentPhase::PreUndeploySucceeded;
+        
+        // Phase 1: Run pre-undeploy hook
         egg.config().unsafe_shell_hooks.run_pre_undeploy()?;
+        
+        // Phase 2: Remove symlinks
         let mut errs = Vec::new();
         for (in_egg, deployed) in mappings {
             if let Err(e) = deployer.remove_symlink_recursive(in_egg, &deployed) {
                 errs.push(e.wrap_err(format!("Failed to remove deployment of {}", in_egg.abbr())));
             }
         }
+        
         if !errs.is_empty() {
+            // Pre-undeploy failure: symlinks not removed, no rollback needed
             return Err(MultiError::new(
                 format!("Failed to undeploy egg {}", egg.name()),
                 errs,
             ));
         }
+        
+        // Symlinks removed successfully - mark phase
+        phase = DeploymentPhase::SymlinksRemoved;
         debug_assert!(
-            !errs.is_empty() || !egg.is_deployed()?,
+            !egg.is_deployed().unwrap_or(false),
             "Egg::is_deployed should return false after undeploying"
         );
-        egg.config().unsafe_shell_hooks.run_post_undeploy()?;
-
-        Ok(())
+        
+        // Phase 3: Run post-undeploy hook with restore on failure
+        match egg.config().unsafe_shell_hooks.run_post_undeploy() {
+            Ok(()) => {
+                phase = DeploymentPhase::PostUndeploySucceeded;
+                Ok(())
+            }
+            Err(e) => {
+                // Post-undeploy failure: restore symlinks to restore state
+                tracing::warn!(
+                    "Post-undeploy hook failed for egg {}, restoring deployment",
+                    egg.name()
+                );
+                let restore_deployer = &mut Deployer::new();
+                for (in_egg, deployed) in mappings {
+                    let _ = match egg.config().strategy {
+                        DeploymentStrategy::Merge => {
+                            restore_deployer.symlink_recursive(egg.path(), in_egg, deployed)
+                        }
+                        DeploymentStrategy::Put => {
+                            if let Some(parent) = deployed.parent() {
+                                let _ = fs_err::create_dir_all(parent);
+                            }
+                            restore_deployer.create_symlink(in_egg, deployed)
+                        }
+                    };
+                }
+                Err(MultiError::new(
+                    format!("Failed to undeploy egg {} (restored)", egg.name()),
+                    vec![e],
+                ))
+            }
+        }
     }
-
     /// Deploy or undeploy the given egg, depending on the current system state and the given Egg data.
     /// Returns true if the egg is now deployed, false if it is not.
     #[tracing::instrument(skip_all, fields(egg.name = %egg.name()))]
