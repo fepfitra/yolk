@@ -1,12 +1,14 @@
 use fs_err::PathExt;
 use miette::miette;
 use miette::{Context, IntoDiagnostic, Result, Severity};
+use owo_colors::OwoColorize as _;
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
 
+use crate::dep_graph::{DepError, DepGraph};
 use crate::deploy::Deployer;
 use crate::multi_error::MultiError;
 use crate::{
@@ -293,12 +295,16 @@ impl Yolk {
         tracing::debug!("Syncing eggs to {mode:?}");
         let mut eval_ctx = self.prepare_eval_ctx_for_templates(mode)?;
 
-        let mut errs = Vec::new();
         let egg_configs = self.load_egg_configs(&mut eval_ctx)?;
 
-        for (name, egg_config) in egg_configs.into_iter() {
+        // Build and sort dependency graph
+        let (sorted_names, _graph) = self.resolve_deps(&egg_configs)?;
+
+        let mut errs = Vec::new();
+        for name in sorted_names {
+            let egg_config = egg_configs.get(&name).expect("Egg config should exist");
             if let Err(e) = self
-                .sync_egg_to_mode(&mut eval_ctx, &name, egg_config, update_deployments)
+                .sync_egg_to_mode(&mut eval_ctx, &name, egg_config.clone(), update_deployments)
                 .wrap_err_with(|| format!("Failed to sync egg `{name}`"))
             {
                 errs.push(e);
@@ -309,6 +315,153 @@ impl Yolk {
         } else {
             Err(MultiError::new("Failed to sync some eggs", errs))
         }
+    }
+
+    /// Build dependency graph and perform topological sort
+    fn resolve_deps(
+        &self,
+        egg_configs: &HashMap<String, EggConfig>,
+    ) -> Result<(Vec<String>, DepGraph), MultiError> {
+        let mut graph = DepGraph::new();
+
+        // Add all eggs to the graph
+        let mut names: Vec<String> = egg_configs.keys().cloned().collect();
+        names.sort(); // Sort for deterministic order
+
+        for name in &names {
+            let config = egg_configs.get(name).expect("Egg config should exist");
+            graph.add_node(name.clone(), config.depends.clone(), config.enabled);
+        }
+
+        // Build reverse edges for dependents
+        graph.build_reverse_edges();
+
+        // Topological sort
+        match graph.topological_sort() {
+            Ok(sorted) => {
+                let sorted_names: Vec<String> = sorted.iter().map(|n| n.name.clone()).collect();
+                Ok((sorted_names, graph))
+            }
+            Err(e) => Err(MultiError::new(
+                "Dependency resolution failed",
+                vec![miette::miette!("{}", e).into()],
+            )),
+        }
+    }
+
+    /// Get the dependency graph for visualization
+    pub fn get_dep_graph(
+        &self,
+        egg_configs: &HashMap<String, EggConfig>,
+    ) -> Result<DepGraph, DepError> {
+        let mut graph = DepGraph::new();
+
+        for (name, config) in egg_configs.iter() {
+            graph.add_node(name.clone(), config.depends.clone(), config.enabled);
+        }
+
+        graph.build_reverse_edges();
+        Ok(graph)
+    }
+
+    /// Get a plan for egg execution order (for display)
+    /// Shows dependency tree with dependents at root, dependencies as children
+    pub fn plan(&self, egg_configs: &HashMap<String, EggConfig>) -> Result<String, DepError> {
+        let graph = self.get_dep_graph(egg_configs)?;
+        // get_dep_graph already calls build_reverse_edges, no need to call it again
+        let sorted = graph.topological_sort()?;
+
+        let mut output = String::new();
+        // Build tree structure from sorted nodes
+        // Roots are nodes that have NO dependents (nothing depends on them)
+        // Children are what each node depends on
+        let mut roots: Vec<&crate::dep_graph::DepNode> = Vec::new();
+        let mut children: std::collections::HashMap<String, Vec<&crate::dep_graph::DepNode>> =
+            std::collections::HashMap::new();
+
+        for node in sorted.iter() {
+            if node.dependents.is_empty() {
+                roots.push(node);
+            }
+            for dep in &node.depends_on {
+                if let Some(dep_node) = graph.get(dep) {
+                    children
+                        .entry(node.name.clone())
+                        .or_default()
+                        .push(dep_node);
+                }
+            }
+        }
+
+        // Sort roots alphabetically
+        roots.sort_by_key(|n| n.name.clone());
+
+        // Sort children for each node
+        for (_, node_list) in children.iter_mut() {
+            node_list.sort_by_key(|n| n.name.clone());
+        }
+
+        // Track which nodes have been shown to avoid duplicates
+        let mut shown: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        fn print_tree(
+            node: &crate::dep_graph::DepNode,
+            prefix: &str,
+            is_last: bool,
+            children: &std::collections::HashMap<String, Vec<&crate::dep_graph::DepNode>>,
+            shown: &mut std::collections::HashSet<String>,
+            output: &mut String,
+        ) {
+            if shown.contains(&node.name) {
+                return;
+            }
+            shown.insert(node.name.clone());
+
+            let status = if node.enabled { "✓" } else { "✗" };
+            let connector = if is_last { "└─ " } else { "├─ " };
+
+            let line = format!("{}{}{} {}", prefix, connector, status, node.name);
+            if node.enabled {
+                let colored = line.if_supports_color(owo_colors::Stream::Stdout, |text| {
+                    text.color(owo_colors::AnsiColors::Green)
+                });
+                output.push_str(&colored.to_string());
+                output.push('\n');
+            } else {
+                output.push_str(&line);
+                output.push('\n');
+            }
+
+            let child_list = children.get(&node.name).cloned().unwrap_or_default();
+            let child_count = child_list.len();
+
+            for (i, child) in child_list.iter().enumerate() {
+                let child_is_last = i == child_count - 1;
+                let new_prefix = if is_last {
+                    format!("{}    ", prefix)
+                } else {
+                    format!("{}│   ", prefix)
+                };
+                print_tree(child, &new_prefix, child_is_last, children, shown, output);
+            }
+        }
+
+        let root_count = roots.len();
+        for (i, root) in roots.iter().enumerate() {
+            let is_last = i == root_count - 1;
+            print_tree(root, "", is_last, &children, &mut shown, &mut output);
+        }
+
+        // Show any nodes that weren't reached from roots (orphans/cycles)
+        for node in sorted {
+            if !shown.contains(&node.name) {
+                let status = if node.enabled { "✓" } else { "✗" };
+                output.push_str(&format!("? {} ({})\n", status, node.name));
+            }
+        }
+
+        output.push_str("\nLegend: ✓ enabled, ✗ disabled, ? unreachable\n");
+        Ok(output)
     }
 
     #[tracing::instrument(skip_all, fields(%name, %sync_deployment, ?egg_config))]

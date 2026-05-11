@@ -119,6 +119,9 @@ pub struct EggConfig {
     pub main_file: Option<PathBuf>,
     pub strategy: DeploymentStrategy,
     pub unsafe_shell_hooks: ShellHooks,
+    /// List of egg names this egg depends on.
+    /// Dependencies are resolved before the dependent egg executes.
+    pub depends: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -129,6 +132,7 @@ enum EggConfigKey {
     Templates,
     Enabled,
     UnsafeShellHooks,
+    Depends,
 }
 
 impl EggConfigKey {
@@ -140,6 +144,7 @@ impl EggConfigKey {
             "templates" => Some(EggConfigKey::Templates),
             "enabled" => Some(EggConfigKey::Enabled),
             "unsafe_shell_hooks" => Some(EggConfigKey::UnsafeShellHooks),
+            "depends" => Some(EggConfigKey::Depends),
             _ => None,
         }
     }
@@ -179,6 +184,7 @@ impl Default for EggConfig {
                 pre_deploy: None,
                 pre_undeploy: None,
             },
+            depends: Vec::new(),
         }
     }
 }
@@ -200,6 +206,7 @@ impl EggConfig {
                 pre_deploy: None,
                 pre_undeploy: None,
             },
+            depends: Vec::new(),
         }
     }
 
@@ -377,6 +384,20 @@ impl EggConfig {
             ShellHooks::default()
         };
 
+        let depends = if let Some(x) = map.get("depends") {
+            x.as_array_ref()
+                .map_err(|t| rhai_error!("`depends` must be a list, but got {t}"))?
+                .iter()
+                .map(|x| {
+                    x.clone()
+                        .into_string()
+                        .map_err(|e| rhai_error!("depends entry must be a string, but got {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+
         Ok(EggConfig {
             targets,
             enabled,
@@ -384,6 +405,7 @@ impl EggConfig {
             main_file,
             strategy,
             unsafe_shell_hooks,
+            depends,
         })
     }
 }

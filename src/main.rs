@@ -101,6 +101,13 @@ enum Command {
     /// List all the eggs in your yolk directory
     List,
 
+    /// Display the execution plan based on egg dependencies.
+    Plan {
+        /// Show verbose output with dependency details
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Open your `yolk.rhai` or the given egg in your `$EDITOR` of choice.
     Edit { egg: Option<String> },
 
@@ -239,20 +246,45 @@ fn run_command(args: Args) -> Result<()> {
             })?;
         }
         Command::List => {
-            let mut eggs = yolk.list_eggs()?;
-            eggs.sort_by_key(|egg| egg.name().to_string());
-            for egg in eggs {
-                let deployed = egg.is_deployed()?;
-                let text = format!("{} {}", if deployed { "✓" } else { "✗" }, egg.name());
-                let text = text.if_supports_color(owo_colors::Stream::Stdout, |text| {
-                    text.color(match deployed {
-                        true => owo_colors::AnsiColors::Green,
-                        false => owo_colors::AnsiColors::Default,
-                    })
-                });
-                println!("{}", text);
+            yolk.init_git_config(None)?;
+            yolk.paths().check()?;
+            yolk.validate_config_invariants()?;
+            yolk.with_canonical_state(|| Ok(()))?;
+
+            let mut eval_ctx = yolk.prepare_eval_ctx_for_templates(EvalMode::Local)?;
+            let egg_configs = yolk.load_egg_configs(&mut eval_ctx)?;
+
+            match yolk.plan(&egg_configs) {
+                Ok(plan_output) => {
+                    print!("{}", plan_output);
+                }
+                Err(e) => {
+                    eprintln!("Dependency error: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
+
+        Command::Plan { verbose: _ } => {
+            yolk.init_git_config(None)?;
+            yolk.paths().check()?;
+            yolk.validate_config_invariants()?;
+            yolk.with_canonical_state(|| Ok(()))?;
+
+            let mut eval_ctx = yolk.prepare_eval_ctx_for_templates(EvalMode::Local)?;
+            let egg_configs = yolk.load_egg_configs(&mut eval_ctx)?;
+
+            match yolk.plan(&egg_configs) {
+                Ok(plan_output) => {
+                    println!("{}", plan_output);
+                }
+                Err(e) => {
+                    eprintln!("Dependency error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Command::Sync { canonical } => {
             // Lets always ensure that the yolk dir is in a properly set up state.
             // This should later be replaced with some sort of version-aware compatibility check.
